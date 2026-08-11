@@ -23,37 +23,6 @@ on:
         description: '版本号（必填，如 2026.06.0）'
         type: string
         default: ''
-      # Machine list should match stable.json's homeassistant object keys.
-      # If a new machine is added to stable.json, add it here too.
-      custom_machine:
-        description: 'HA machine 名（仅 custom_target=homeassistant 时生效）'
-        type: choice
-        options:
-          - default
-          - generic-x86-64
-          - intel-nuc
-          - raspberrypi
-          - raspberrypi2
-          - raspberrypi3
-          - raspberrypi3-64
-          - raspberrypi4
-          - raspberrypi4-64
-          - raspberrypi5-64
-          - yellow
-          - green
-          - khadas-vim3
-          - tinker
-          - odroid-c2
-          - odroid-c4
-          - odroid-m1
-          - odroid-n2
-          - odroid-xu
-          - qemux86
-          - qemux86-64
-          - qemuarm
-          - qemuarm-64
-        default: default
-
 env:
   CN_REGISTRY: ${{ secrets.CN_REGISTRY }}
   CN_NAMESPACE: ${{ secrets.CN_REGISTRY_SPACE }}
@@ -389,6 +358,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: Login to Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -400,24 +372,15 @@ jobs:
         env:
           TARGET: ${{ inputs.custom_target }}
           VERSION: ${{ inputs.custom_version }}
-          MACHINE: ${{ inputs.custom_machine }}
         run: |
           set -euo pipefail
 
           target="$TARGET"
           version="$VERSION"
-          machine="$MACHINE"
 
           if [ -z "$version" ]; then
             echo "::error::custom_version is required (version number cannot be empty)"
             exit 1
-          fi
-
-          # custom_machine only applies to homeassistant target. Warn if the
-          # user changed it for a non-homeassistant target (GitHub Actions UI
-          # cannot conditionally disable inputs, so we notify at runtime).
-          if [ "$target" != "homeassistant" ] && [ "$machine" != "default" ]; then
-            echo "::notice::custom_machine='${machine}' is ignored when custom_target='${target}' (only applies to homeassistant)"
           fi
 
           # Sync a single image: pull with retry, tag all labels, push all.
@@ -444,14 +407,14 @@ jobs:
 
             if [ "$pull_ok" != "true" ]; then
               echo "::error::Image not found after retries: ${src}:${ver}"
-              exit 1
+              return 1
             fi
 
             for tag in "${tags[@]}"; do
               docker tag "${src}:${ver}" "${dest}:${tag}"
               if ! docker push "${dest}:${tag}"; then
                 echo "::error::Failed to push ${dest}:${tag}"
-                exit 1
+                return 1
               fi
             done
 
@@ -461,19 +424,27 @@ jobs:
 
           case "$target" in
             homeassistant)
-              if [ "$machine" = "default" ]; then
-                image_name="home-assistant"
-              else
-                image_name="${machine}-homeassistant"
-              fi
-              src="ghcr.io/home-assistant/${image_name}"
-              dest="${CN_REGISTRY}/${CN_NAMESPACE}/${image_name}"
-              tags=("${version}" "stable")
-              if [ "$machine" = "default" ]; then
-                ym_tag=$(echo "${version}" | awk -F. '{print $1"."$2}')
-                tags+=("latest" "beta" "rc" "${ym_tag}")
-              fi
-              sync_one "$src" "$dest" "$version" "${tags[@]}"
+              # Sync all machines listed in stable.json with the user-specified
+              # version. Machines whose upstream image doesn't have this version
+              # (e.g. pinned to an older release) are skipped with a warning.
+              mapfile -t machines < <(jq -r '.homeassistant | keys[]' stable.json)
+              for machine in "${machines[@]}"; do
+                if [ "$machine" = "default" ]; then
+                  image_name="home-assistant"
+                else
+                  image_name="${machine}-homeassistant"
+                fi
+                src="ghcr.io/home-assistant/${image_name}"
+                dest="${CN_REGISTRY}/${CN_NAMESPACE}/${image_name}"
+                if [ "$machine" = "default" ]; then
+                  ym_tag=$(echo "${version}" | awk -F. '{print $1"."$2}')
+                  sync_one "$src" "$dest" "$version" "${version}" "stable" "latest" "beta" "rc" "${ym_tag}" \
+                    || echo "::warning::Skipped ${image_name}:${version} (image not available)"
+                else
+                  sync_one "$src" "$dest" "$version" "${version}" "stable" \
+                    || echo "::warning::Skipped ${image_name}:${version} (image not available)"
+                fi
+              done
               ;;
             cli|dns|audio|multicast|observer)
               for arch in amd64 aarch64; do
