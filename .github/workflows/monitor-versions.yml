@@ -7,11 +7,42 @@ on:
       - 'stable.json'
   workflow_dispatch:
     inputs:
-      force_full_sync:
-        description: '强制全量同步（忽略版本比对，重推所有镜像；拉取失败的镜像会跳过而非报错）'
-        required: false
-        type: boolean
-        default: false
+      sync_mode:
+        description: '同步模式：incremental=增量比对, full=全量重推, custom=自定义单镜像'
+        type: choice
+        options:
+          - incremental
+          - full
+          - custom
+        default: incremental
+      custom_target:
+        description: '自定义同步目标（仅 custom 模式）'
+        type: choice
+        options:
+          - homeassistant
+          - cli
+          - dns
+          - audio
+          - multicast
+          - observer
+          - supervisor
+        default: cli
+      custom_version:
+        description: '版本号（仅 custom 模式，如 2026.06.0）'
+        type: string
+        default: ''
+      custom_machine:
+        description: 'HA machine 名（仅 custom_target=homeassistant 时生效，如 default/raspberrypi4-64）'
+        type: string
+        default: 'default'
+      custom_arch:
+        description: '架构（仅组件/supervisor 目标生效）'
+        type: choice
+        options:
+          - amd64
+          - aarch64
+          - both
+        default: both
 
 env:
   CN_REGISTRY: ${{ secrets.CN_REGISTRY }}
@@ -26,6 +57,7 @@ concurrency:
 
 jobs:
   monitor:
+    if: ${{ github.event_name == 'push' || inputs.sync_mode != 'custom' }}
     runs-on: ubuntu-latest
     outputs:
       changed_machines: ${{ steps.compare.outputs.changed_machines }}
@@ -44,7 +76,7 @@ jobs:
     - name: Compare versions
       id: compare
       env:
-        FORCE_FULL: ${{ github.event.inputs.force_full_sync == 'true' }}
+        FORCE_FULL: ${{ inputs.sync_mode == 'full' }}
       run: |
         set -euo pipefail
 
@@ -373,3 +405,119 @@ jobs:
 
           docker rmi "${SRC_IMAGE}:${version}" 2>/dev/null || true
           echo "::notice::Successfully synced supervisor:${version} for ${ARCH}"
+
+  sync_custom:
+    if: ${{ inputs.sync_mode == 'custom' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Login to Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.CN_REGISTRY }}
+          username: ${{ secrets.CN_REGISTRY_USERNAME }}
+          password: ${{ secrets.CN_REGISTRY_PASSWORD }}
+
+      - name: Sync custom image
+        env:
+          TARGET: ${{ inputs.custom_target }}
+          VERSION: ${{ inputs.custom_version }}
+          MACHINE: ${{ inputs.custom_machine }}
+          ARCH_MODE: ${{ inputs.custom_arch }}
+        run: |
+          set -euo pipefail
+
+          target="$TARGET"
+          version="$VERSION"
+          machine="$MACHINE"
+          arch_mode="$ARCH_MODE"
+
+          if [ -z "$version" ]; then
+            echo "::error::custom_version is required for custom sync mode"
+            exit 1
+          fi
+
+          # Sync a single image: pull with retry, tag all labels, push all.
+          # Tag strategy mirrors the automatic sync jobs:
+          #   homeassistant default  -> version + stable + latest + beta + rc + YYYY.M
+          #   homeassistant <other>  -> version + stable
+          #   component / supervisor -> version + latest
+          sync_one() {
+            local src="$1" dest="$2" ver="$3"
+            shift 3
+            local tags=("$@")
+
+            echo "::notice::Syncing ${src}:${ver} -> ${dest}"
+
+            pull_ok=false
+            for i in 1 2 3; do
+              if docker pull "${src}:${ver}"; then
+                pull_ok=true
+                break
+              fi
+              echo "::warning::Pull attempt ${i} failed for ${src}:${ver}, retrying in 5s"
+              sleep 5
+            done
+
+            if [ "$pull_ok" != "true" ]; then
+              echo "::error::Image not found after retries: ${src}:${ver}"
+              exit 1
+            fi
+
+            for tag in "${tags[@]}"; do
+              docker tag "${src}:${ver}" "${dest}:${tag}"
+              if ! docker push "${dest}:${tag}"; then
+                echo "::error::Failed to push ${dest}:${tag}"
+                exit 1
+              fi
+            done
+
+            docker rmi "${src}:${ver}" 2>/dev/null || true
+            echo "::notice::Successfully synced ${dest}:${ver}"
+          }
+
+          case "$target" in
+            homeassistant)
+              if [ "$machine" = "default" ]; then
+                image_name="home-assistant"
+              else
+                image_name="${machine}-homeassistant"
+              fi
+              src="ghcr.io/home-assistant/${image_name}"
+              dest="${CN_REGISTRY}/${CN_NAMESPACE}/${image_name}"
+              tags=("${version}" "stable")
+              if [ "$machine" = "default" ]; then
+                ym_tag=$(echo "${version}" | awk -F. '{print $1"."$2}')
+                tags+=("latest" "beta" "rc" "${ym_tag}")
+              fi
+              sync_one "$src" "$dest" "$version" "${tags[@]}"
+              ;;
+            cli|dns|audio|multicast|observer)
+              if [ "$arch_mode" = "both" ]; then
+                archs="amd64 aarch64"
+              else
+                archs="$arch_mode"
+              fi
+              for arch in $archs; do
+                src="ghcr.io/home-assistant/${arch}-hassio-${target}"
+                dest="${CN_REGISTRY}/${CN_NAMESPACE}/${arch}-hassio-${target}"
+                sync_one "$src" "$dest" "$version" "${version}" "latest"
+              done
+              ;;
+            supervisor)
+              if [ "$arch_mode" = "both" ]; then
+                archs="amd64 aarch64"
+              else
+                archs="$arch_mode"
+              fi
+              for arch in $archs; do
+                src="ghcr.io/home-assistant-cn/${arch}-hassio-supervisor"
+                dest="${CN_REGISTRY}/${CN_NAMESPACE}/${arch}-hassio-supervisor"
+                sync_one "$src" "$dest" "$version" "${version}" "latest"
+              done
+              ;;
+            *)
+              echo "::error::Unknown custom_target: ${target}"
+              exit 1
+              ;;
+          esac
