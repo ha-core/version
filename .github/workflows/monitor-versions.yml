@@ -7,16 +7,8 @@ on:
       - 'stable.json'
   workflow_dispatch:
     inputs:
-      sync_mode:
-        description: '同步模式：incremental=增量比对, full=全量重推, custom=自定义单镜像'
-        type: choice
-        options:
-          - incremental
-          - full
-          - custom
-        default: incremental
       custom_target:
-        description: '自定义同步目标（仅 custom 模式）'
+        description: '同步目标'
         type: choice
         options:
           - homeassistant
@@ -28,7 +20,7 @@ on:
           - supervisor
         default: cli
       custom_version:
-        description: '版本号（仅 custom 模式，如 2026.06.0）'
+        description: '版本号（必填，如 2026.06.0）'
         type: string
         default: ''
       # Machine list should match stable.json's homeassistant object keys.
@@ -61,15 +53,6 @@ on:
           - qemuarm
           - qemuarm-64
         default: default
-      full_sync_scope:
-        description: '全量同步范围（仅 sync_mode=full 时生效）'
-        type: choice
-        options:
-          - all
-          - homeassistant
-          - components
-          - supervisor
-        default: all
 
 env:
   CN_REGISTRY: ${{ secrets.CN_REGISTRY }}
@@ -84,7 +67,7 @@ concurrency:
 
 jobs:
   monitor:
-    if: ${{ github.event_name == 'push' || inputs.sync_mode != 'custom' }}
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
     outputs:
       changed_machines: ${{ steps.compare.outputs.changed_machines }}
@@ -93,7 +76,6 @@ jobs:
       components_changed: ${{ steps.compare.outputs.components_changed }}
       supervisor_changed: ${{ steps.compare.outputs.supervisor_changed }}
       new_supervisor_version: ${{ steps.compare.outputs.new_supervisor_version }}
-      full_sync: ${{ steps.compare.outputs.full_sync }}
     steps:
     - name: Checkout repository
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -102,23 +84,11 @@ jobs:
 
     - name: Compare versions
       id: compare
-      env:
-        FORCE_FULL: ${{ inputs.sync_mode == 'full' }}
-        SCOPE: ${{ inputs.full_sync_scope || 'all' }}
       run: |
         set -euo pipefail
 
         CURRENT=$(cat stable.json)
-        if [ "$FORCE_FULL" = "true" ]; then
-          # Treat all current versions as changed by comparing against an empty
-          # baseline. Downstream pull failures are tolerated (skip) in this mode,
-          # since some images may legitimately not exist (e.g. 32-bit machines
-          # pinned at old versions that upstream no longer publishes).
-          PREVIOUS='{}'
-          echo "::notice::Force full sync requested, treating all versions as changed"
-        else
-          PREVIOUS=$(git show HEAD^:stable.json 2>/dev/null || echo '{}')
-        fi
+        PREVIOUS=$(git show HEAD^:stable.json 2>/dev/null || echo '{}')
 
         # Per-machine Home Assistant version comparison.
         # stable.json pins specific versions per machine (e.g. qemux86 may lag
@@ -171,25 +141,6 @@ jobs:
           NEW_SUPERVISOR="$CURRENT_SUPERVISOR"
         fi
 
-        # Apply full_sync_scope filter: in full mode, allow syncing only a subset.
-        if [ "$FORCE_FULL" = "true" ] && [ "$SCOPE" != "all" ]; then
-          if [ "$SCOPE" != "homeassistant" ]; then
-            CHANGED_MACHINES='[]'
-            HA_CHANGED=false
-            echo "::notice::Full sync scope='${SCOPE}': skipping homeassistant"
-          fi
-          if [ "$SCOPE" != "components" ]; then
-            COMPONENT_NAMES='[]'
-            COMPONENTS_CHANGED=false
-            echo "::notice::Full sync scope='${SCOPE}': skipping components"
-          fi
-          if [ "$SCOPE" != "supervisor" ]; then
-            SUPERVISOR_CHANGED=false
-            NEW_SUPERVISOR=""
-            echo "::notice::Full sync scope='${SCOPE}': skipping supervisor"
-          fi
-        fi
-
         {
           echo "changed_machines=${CHANGED_MACHINES}"
           echo "homeassistant_changed=${HA_CHANGED}"
@@ -197,7 +148,6 @@ jobs:
           echo "components_changed=${COMPONENTS_CHANGED}"
           echo "supervisor_changed=${SUPERVISOR_CHANGED}"
           echo "new_supervisor_version=${NEW_SUPERVISOR}"
-          echo "full_sync=${FORCE_FULL}"
         } >> "$GITHUB_OUTPUT"
 
         echo "::notice::Changed machines: ${CHANGED_MACHINES}"
@@ -228,7 +178,6 @@ jobs:
         env:
           MACHINE: ${{ matrix.machine }}
           VERSION: ${{ matrix.version }}
-          FULL_SYNC: ${{ needs.monitor.outputs.full_sync }}
         run: |
           set -euo pipefail
 
@@ -246,7 +195,6 @@ jobs:
 
           echo "Processing ${image_name} version ${version}"
 
-          # Pull with retry to tolerate transient registry errors.
           pull_ok=false
           for i in 1 2 3; do
             if docker pull "${SRC_IMAGE}:${version}"; then
@@ -258,13 +206,8 @@ jobs:
           done
 
           if [ "$pull_ok" != "true" ]; then
-            if [ "$FULL_SYNC" = "true" ]; then
-              echo "::warning::Image not found, skipping (full sync mode): ${SRC_IMAGE}:${version}"
-              exit 0
-            else
-              echo "::error::Image not found after retries: ${SRC_IMAGE}:${version}"
-              exit 1
-            fi
+            echo "::error::Image not found after retries: ${SRC_IMAGE}:${version}"
+            exit 1
           fi
 
           docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:${version}"
@@ -341,7 +284,6 @@ jobs:
           COMPONENT: ${{ matrix.component }}
           ARCH: ${{ matrix.arch }}
           VERSION: ${{ steps.get_version.outputs.version }}
-          FULL_SYNC: ${{ needs.monitor.outputs.full_sync }}
         run: |
           set -euo pipefail
 
@@ -363,13 +305,8 @@ jobs:
           done
 
           if [ "$pull_ok" != "true" ]; then
-            if [ "$FULL_SYNC" = "true" ]; then
-              echo "::warning::Image not found, skipping (full sync mode): ${SRC_IMAGE}:${version}"
-              exit 0
-            else
-              echo "::error::Image not found after retries: ${SRC_IMAGE}:${version}"
-              exit 1
-            fi
+            echo "::error::Image not found after retries: ${SRC_IMAGE}:${version}"
+            exit 1
           fi
 
           docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:${version}"
@@ -407,7 +344,6 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}
           VERSION: ${{ needs.monitor.outputs.new_supervisor_version }}
-          FULL_SYNC: ${{ needs.monitor.outputs.full_sync }}
         run: |
           set -euo pipefail
 
@@ -431,13 +367,8 @@ jobs:
           done
 
           if [ "$pull_ok" != "true" ]; then
-            if [ "$FULL_SYNC" = "true" ]; then
-              echo "::warning::Image not found, skipping (full sync mode): ${SRC_IMAGE}:${version}"
-              exit 0
-            else
-              echo "::error::Image not found after retries: ${SRC_IMAGE}:${version}"
-              exit 1
-            fi
+            echo "::error::Image not found after retries: ${SRC_IMAGE}:${version}"
+            exit 1
           fi
 
           docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:${version}"
@@ -454,7 +385,7 @@ jobs:
           echo "::notice::Successfully synced supervisor:${version} for ${ARCH}"
 
   sync_custom:
-    if: ${{ inputs.sync_mode == 'custom' }}
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -478,7 +409,7 @@ jobs:
           machine="$MACHINE"
 
           if [ -z "$version" ]; then
-            echo "::error::custom_version is required for custom sync mode"
+            echo "::error::custom_version is required (version number cannot be empty)"
             exit 1
           fi
 
