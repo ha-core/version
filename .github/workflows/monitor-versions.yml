@@ -453,6 +453,13 @@ jobs:
             exit 1
           fi
 
+          # custom_machine only applies to homeassistant target. Warn if the
+          # user changed it for a non-homeassistant target (GitHub Actions UI
+          # cannot conditionally disable inputs, so we notify at runtime).
+          if [ "$target" != "homeassistant" ] && [ "$machine" != "default" ]; then
+            echo "::notice::custom_machine='${machine}' is ignored when custom_target='${target}' (only applies to homeassistant)"
+          fi
+
           # Sync a single image: pull with retry, tag all labels, push all.
           # Tag strategy mirrors the automatic sync jobs:
           #   homeassistant default  -> version + stable + latest + beta + rc + YYYY.M
