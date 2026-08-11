@@ -1,0 +1,375 @@
+name: Monitor and Sync Home Assistant Versions
+
+on:
+  push:
+    branches: ["master"]
+    paths:
+      - 'stable.json'
+  workflow_dispatch:
+    inputs:
+      force_full_sync:
+        description: '强制全量同步（忽略版本比对，重推所有镜像；拉取失败的镜像会跳过而非报错）'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CN_REGISTRY: ${{ secrets.CN_REGISTRY }}
+  CN_NAMESPACE: ${{ secrets.CN_REGISTRY_SPACE }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monitor-versions-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    outputs:
+      changed_machines: ${{ steps.compare.outputs.changed_machines }}
+      homeassistant_changed: ${{ steps.compare.outputs.homeassistant_changed }}
+      component_names: ${{ steps.compare.outputs.component_names }}
+      components_changed: ${{ steps.compare.outputs.components_changed }}
+      supervisor_changed: ${{ steps.compare.outputs.supervisor_changed }}
+      new_supervisor_version: ${{ steps.compare.outputs.new_supervisor_version }}
+      full_sync: ${{ steps.compare.outputs.full_sync }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 2
+
+    - name: Compare versions
+      id: compare
+      env:
+        FORCE_FULL: ${{ github.event.inputs.force_full_sync == 'true' }}
+      run: |
+        set -euo pipefail
+
+        CURRENT=$(cat stable.json)
+        if [ "$FORCE_FULL" = "true" ]; then
+          # Treat all current versions as changed by comparing against an empty
+          # baseline. Downstream pull failures are tolerated (skip) in this mode,
+          # since some images may legitimately not exist (e.g. 32-bit machines
+          # pinned at old versions that upstream no longer publishes).
+          PREVIOUS='{}'
+          echo "::notice::Force full sync requested, treating all versions as changed"
+        else
+          PREVIOUS=$(git show HEAD^:stable.json 2>/dev/null || echo '{}')
+        fi
+
+        # Per-machine Home Assistant version comparison.
+        # stable.json pins specific versions per machine (e.g. qemux86 may lag
+        # behind default); only machines whose value actually changed need syncing.
+        CHANGED_MACHINES=$(jq -nc '
+          ($cur.homeassistant // {}) as $c
+          | ($prev.homeassistant // {}) as $p
+          | $c | to_entries
+          | map(select(
+              (.value | type) == "string"
+              and .value != ""
+              and .value != ($p[.key] // null)
+            )
+            | {machine: .key, version: .value}
+          )
+        ' --argjson cur "$CURRENT" --argjson prev "$PREVIOUS")
+
+        HA_CHANGED=false
+        if [ "$(printf '%s' "$CHANGED_MACHINES" | jq 'length')" -gt 0 ]; then
+          HA_CHANGED=true
+        fi
+
+        # HassIO component comparison (top-level fields: cli, dns, audio,
+        # multicast, observer). Each has a single version across all arches.
+        COMPONENT_NAMES=$(jq -nc '
+          ["cli","dns","audio","multicast","observer"] as $keys
+          | $keys
+          | map(select(
+              ($cur[.] // null) != ($prev[.] // null)
+              and ($cur[.] | type) == "string"
+            ))
+        ' --argjson cur "$CURRENT" --argjson prev "$PREVIOUS")
+
+        COMPONENTS_CHANGED=false
+        if [ "$(printf '%s' "$COMPONENT_NAMES" | jq 'length')" -gt 0 ]; then
+          COMPONENTS_CHANGED=true
+        fi
+
+        # Supervisor version comparison (top-level field).
+        # supervisor is self-built in the supervisor repo and pushed to
+        # ghcr.io/home-assistant-cn/<arch>-hassio-supervisor. builder.yml's
+        # version job updates this field AFTER the image is published, so when
+        # this workflow triggers the upstream image is already available.
+        CURRENT_SUPERVISOR=$(jq -r '.supervisor // empty' <<< "$CURRENT")
+        PREVIOUS_SUPERVISOR=$(jq -r '.supervisor // empty' <<< "$PREVIOUS")
+        SUPERVISOR_CHANGED=false
+        NEW_SUPERVISOR=""
+        if [ -n "$CURRENT_SUPERVISOR" ] && [ "$CURRENT_SUPERVISOR" != "$PREVIOUS_SUPERVISOR" ]; then
+          SUPERVISOR_CHANGED=true
+          NEW_SUPERVISOR="$CURRENT_SUPERVISOR"
+        fi
+
+        {
+          echo "changed_machines=${CHANGED_MACHINES}"
+          echo "homeassistant_changed=${HA_CHANGED}"
+          echo "component_names=${COMPONENT_NAMES}"
+          echo "components_changed=${COMPONENTS_CHANGED}"
+          echo "supervisor_changed=${SUPERVISOR_CHANGED}"
+          echo "new_supervisor_version=${NEW_SUPERVISOR}"
+          echo "full_sync=${FORCE_FULL}"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "::notice::Changed machines: ${CHANGED_MACHINES}"
+        echo "::notice::Changed components: ${COMPONENT_NAMES}"
+        if [ "$SUPERVISOR_CHANGED" = "true" ]; then
+          echo "::notice::Changed supervisor: ${NEW_SUPERVISOR}"
+        fi
+
+  sync_homeassistant:
+    needs: monitor
+    if: ${{ needs.monitor.outputs.homeassistant_changed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        include: ${{ fromJSON(needs.monitor.outputs.changed_machines) }}
+    steps:
+      - name: Login to Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.CN_REGISTRY }}
+          username: ${{ secrets.CN_REGISTRY_USERNAME }}
+          password: ${{ secrets.CN_REGISTRY_PASSWORD }}
+
+      - name: Process Home Assistant image
+        env:
+          MACHINE: ${{ matrix.machine }}
+          VERSION: ${{ matrix.version }}
+          FULL_SYNC: ${{ needs.monitor.outputs.full_sync }}
+        run: |
+          set -euo pipefail
+
+          machine="$MACHINE"
+          version="$VERSION"
+
+          if [ "$machine" = "default" ]; then
+            image_name="home-assistant"
+          else
+            image_name="${machine}-homeassistant"
+          fi
+
+          SRC_IMAGE="ghcr.io/home-assistant/${image_name}"
+          DEST_IMAGE="${CN_REGISTRY}/${CN_NAMESPACE}/${image_name}"
+
+          echo "Processing ${image_name} version ${version}"
+
+          # Pull with retry to tolerate transient registry errors.
+          pull_ok=false
+          for i in 1 2 3; do
+            if docker pull "${SRC_IMAGE}:${version}"; then
+              pull_ok=true
+              break
+            fi
+            echo "::warning::Pull attempt ${i} failed for ${SRC_IMAGE}:${version}, retrying in 5s"
+            sleep 5
+          done
+
+          if [ "$pull_ok" != "true" ]; then
+            if [ "$FULL_SYNC" = "true" ]; then
+              echo "::warning::Image not found, skipping (full sync mode): ${SRC_IMAGE}:${version}"
+              exit 0
+            else
+              echo "::error::Image not found after retries: ${SRC_IMAGE}:${version}"
+              exit 1
+            fi
+          fi
+
+          docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:${version}"
+          docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:stable"
+
+          # The generic image additionally carries latest + beta/rc channel
+          # tags and a YYYY.M tag. stable.json is the stable channel, so
+          # beta/rc tags here point at the stable build (CN mirror fallback).
+          if [ "$machine" = "default" ]; then
+            ym_tag=$(echo "${version}" | awk -F. '{print $1"."$2}')
+            docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:latest"
+            docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:beta"
+            docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:rc"
+            docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:${ym_tag}"
+          fi
+
+          for tag in "${version}" stable; do
+            if ! docker push "${DEST_IMAGE}:${tag}"; then
+              echo "::error::Failed to push ${DEST_IMAGE}:${tag}"
+              exit 1
+            fi
+          done
+
+          if [ "$machine" = "default" ]; then
+            for tag in latest beta rc "${ym_tag}"; do
+              if ! docker push "${DEST_IMAGE}:${tag}"; then
+                echo "::error::Failed to push ${DEST_IMAGE}:${tag}"
+                exit 1
+              fi
+            done
+          fi
+
+          docker rmi "${SRC_IMAGE}:${version}" 2>/dev/null || true
+          echo "::notice::Successfully synced ${image_name}:${version}"
+
+  sync_hassio_components:
+    needs: monitor
+    if: ${{ needs.monitor.outputs.components_changed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        arch: ['amd64', 'aarch64']
+        component: ${{ fromJSON(needs.monitor.outputs.component_names) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Login to Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.CN_REGISTRY }}
+          username: ${{ secrets.CN_REGISTRY_USERNAME }}
+          password: ${{ secrets.CN_REGISTRY_PASSWORD }}
+
+      - name: Get component version
+        id: get_version
+        env:
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          set -euo pipefail
+          component="$COMPONENT"
+          version=$(jq -r --arg c "$component" '.[$c]' stable.json)
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "::error::Version not found for component ${component}"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Process HassIO component
+        env:
+          COMPONENT: ${{ matrix.component }}
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ steps.get_version.outputs.version }}
+          FULL_SYNC: ${{ needs.monitor.outputs.full_sync }}
+        run: |
+          set -euo pipefail
+
+          component="$COMPONENT"
+          version="$VERSION"
+          SRC_IMAGE="ghcr.io/home-assistant/${ARCH}-hassio-${component}"
+          DEST_IMAGE="${CN_REGISTRY}/${CN_NAMESPACE}/${ARCH}-hassio-${component}"
+
+          echo "Processing ${component} version ${version} for ${ARCH}"
+
+          pull_ok=false
+          for i in 1 2 3; do
+            if docker pull "${SRC_IMAGE}:${version}"; then
+              pull_ok=true
+              break
+            fi
+            echo "::warning::Pull attempt ${i} failed for ${SRC_IMAGE}:${version}, retrying in 5s"
+            sleep 5
+          done
+
+          if [ "$pull_ok" != "true" ]; then
+            if [ "$FULL_SYNC" = "true" ]; then
+              echo "::warning::Image not found, skipping (full sync mode): ${SRC_IMAGE}:${version}"
+              exit 0
+            else
+              echo "::error::Image not found after retries: ${SRC_IMAGE}:${version}"
+              exit 1
+            fi
+          fi
+
+          docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:${version}"
+          docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:latest"
+
+          for tag in "${version}" latest; do
+            if ! docker push "${DEST_IMAGE}:${tag}"; then
+              echo "::error::Failed to push ${DEST_IMAGE}:${tag}"
+              exit 1
+            fi
+          done
+
+          docker rmi "${SRC_IMAGE}:${version}" 2>/dev/null || true
+          echo "::notice::Successfully synced ${component}:${version} for ${ARCH}"
+
+  sync_supervisor:
+    needs: monitor
+    if: ${{ needs.monitor.outputs.supervisor_changed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        arch: ['amd64', 'aarch64']
+    steps:
+      - name: Login to Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.CN_REGISTRY }}
+          username: ${{ secrets.CN_REGISTRY_USERNAME }}
+          password: ${{ secrets.CN_REGISTRY_PASSWORD }}
+
+      - name: Process Supervisor image
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ needs.monitor.outputs.new_supervisor_version }}
+          FULL_SYNC: ${{ needs.monitor.outputs.full_sync }}
+        run: |
+          set -euo pipefail
+
+          version="$VERSION"
+          # supervisor is self-built and published to the home-assistant-cn
+          # ghcr namespace (not the official home-assistant namespace). The
+          # package is public, so no ghcr login is required to pull.
+          SRC_IMAGE="ghcr.io/home-assistant-cn/${ARCH}-hassio-supervisor"
+          DEST_IMAGE="${CN_REGISTRY}/${CN_NAMESPACE}/${ARCH}-hassio-supervisor"
+
+          echo "Processing supervisor ${ARCH} version ${version}"
+
+          pull_ok=false
+          for i in 1 2 3; do
+            if docker pull "${SRC_IMAGE}:${version}"; then
+              pull_ok=true
+              break
+            fi
+            echo "::warning::Pull attempt ${i} failed for ${SRC_IMAGE}:${version}, retrying in 5s"
+            sleep 5
+          done
+
+          if [ "$pull_ok" != "true" ]; then
+            if [ "$FULL_SYNC" = "true" ]; then
+              echo "::warning::Image not found, skipping (full sync mode): ${SRC_IMAGE}:${version}"
+              exit 0
+            else
+              echo "::error::Image not found after retries: ${SRC_IMAGE}:${version}"
+              exit 1
+            fi
+          fi
+
+          docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:${version}"
+          docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:latest"
+
+          for tag in "${version}" latest; do
+            if ! docker push "${DEST_IMAGE}:${tag}"; then
+              echo "::error::Failed to push ${DEST_IMAGE}:${tag}"
+              exit 1
+            fi
+          done
+
+          docker rmi "${SRC_IMAGE}:${version}" 2>/dev/null || true
+          echo "::notice::Successfully synced supervisor:${version} for ${ARCH}"
