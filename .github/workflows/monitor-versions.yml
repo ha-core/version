@@ -31,10 +31,36 @@ on:
         description: '版本号（仅 custom 模式，如 2026.06.0）'
         type: string
         default: ''
+      # Machine list should match stable.json's homeassistant object keys.
+      # If a new machine is added to stable.json, add it here too.
       custom_machine:
-        description: 'HA machine 名（仅 custom_target=homeassistant 时生效，如 default/raspberrypi4-64）'
-        type: string
-        default: 'default'
+        description: 'HA machine 名（仅 custom_target=homeassistant 时生效）'
+        type: choice
+        options:
+          - default
+          - generic-x86-64
+          - intel-nuc
+          - raspberrypi
+          - raspberrypi2
+          - raspberrypi3
+          - raspberrypi3-64
+          - raspberrypi4
+          - raspberrypi4-64
+          - raspberrypi5-64
+          - yellow
+          - green
+          - khadas-vim3
+          - tinker
+          - odroid-c2
+          - odroid-c4
+          - odroid-m1
+          - odroid-n2
+          - odroid-xu
+          - qemux86
+          - qemux86-64
+          - qemuarm
+          - qemuarm-64
+        default: default
 
 env:
   CN_REGISTRY: ${{ secrets.CN_REGISTRY }}
