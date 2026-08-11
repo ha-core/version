@@ -61,6 +61,15 @@ on:
           - qemuarm
           - qemuarm-64
         default: default
+      full_sync_scope:
+        description: '全量同步范围（仅 sync_mode=full 时生效）'
+        type: choice
+        options:
+          - all
+          - homeassistant
+          - components
+          - supervisor
+        default: all
 
 env:
   CN_REGISTRY: ${{ secrets.CN_REGISTRY }}
@@ -95,6 +104,7 @@ jobs:
       id: compare
       env:
         FORCE_FULL: ${{ inputs.sync_mode == 'full' }}
+        SCOPE: ${{ inputs.full_sync_scope || 'all' }}
       run: |
         set -euo pipefail
 
@@ -159,6 +169,25 @@ jobs:
         if [ -n "$CURRENT_SUPERVISOR" ] && [ "$CURRENT_SUPERVISOR" != "$PREVIOUS_SUPERVISOR" ]; then
           SUPERVISOR_CHANGED=true
           NEW_SUPERVISOR="$CURRENT_SUPERVISOR"
+        fi
+
+        # Apply full_sync_scope filter: in full mode, allow syncing only a subset.
+        if [ "$FORCE_FULL" = "true" ] && [ "$SCOPE" != "all" ]; then
+          if [ "$SCOPE" != "homeassistant" ]; then
+            CHANGED_MACHINES='[]'
+            HA_CHANGED=false
+            echo "::notice::Full sync scope='${SCOPE}': skipping homeassistant"
+          fi
+          if [ "$SCOPE" != "components" ]; then
+            COMPONENT_NAMES='[]'
+            COMPONENTS_CHANGED=false
+            echo "::notice::Full sync scope='${SCOPE}': skipping components"
+          fi
+          if [ "$SCOPE" != "supervisor" ]; then
+            SUPERVISOR_CHANGED=false
+            NEW_SUPERVISOR=""
+            echo "::notice::Full sync scope='${SCOPE}': skipping supervisor"
+          fi
         fi
 
         {
