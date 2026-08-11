@@ -35,14 +35,6 @@ on:
         description: 'HA machine 名（仅 custom_target=homeassistant 时生效，如 default/raspberrypi4-64）'
         type: string
         default: 'default'
-      custom_arch:
-        description: '架构（仅组件/supervisor 目标生效）'
-        type: choice
-        options:
-          - amd64
-          - aarch64
-          - both
-        default: both
 
 env:
   CN_REGISTRY: ${{ secrets.CN_REGISTRY }}
@@ -423,14 +415,12 @@ jobs:
           TARGET: ${{ inputs.custom_target }}
           VERSION: ${{ inputs.custom_version }}
           MACHINE: ${{ inputs.custom_machine }}
-          ARCH_MODE: ${{ inputs.custom_arch }}
         run: |
           set -euo pipefail
 
           target="$TARGET"
           version="$VERSION"
           machine="$MACHINE"
-          arch_mode="$ARCH_MODE"
 
           if [ -z "$version" ]; then
             echo "::error::custom_version is required for custom sync mode"
@@ -493,24 +483,14 @@ jobs:
               sync_one "$src" "$dest" "$version" "${tags[@]}"
               ;;
             cli|dns|audio|multicast|observer)
-              if [ "$arch_mode" = "both" ]; then
-                archs="amd64 aarch64"
-              else
-                archs="$arch_mode"
-              fi
-              for arch in $archs; do
+              for arch in amd64 aarch64; do
                 src="ghcr.io/home-assistant/${arch}-hassio-${target}"
                 dest="${CN_REGISTRY}/${CN_NAMESPACE}/${arch}-hassio-${target}"
                 sync_one "$src" "$dest" "$version" "${version}" "latest"
               done
               ;;
             supervisor)
-              if [ "$arch_mode" = "both" ]; then
-                archs="amd64 aarch64"
-              else
-                archs="$arch_mode"
-              fi
-              for arch in $archs; do
+              for arch in amd64 aarch64; do
                 src="ghcr.io/home-assistant-cn/${arch}-hassio-supervisor"
                 dest="${CN_REGISTRY}/${CN_NAMESPACE}/${arch}-hassio-supervisor"
                 sync_one "$src" "$dest" "$version" "${version}" "latest"
