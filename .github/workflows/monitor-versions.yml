@@ -165,13 +165,13 @@ jobs:
           echo "Processing ${image_name} version ${version}"
 
           pull_ok=false
-          for i in 1 2 3; do
+          for i in 1 2; do
             if docker pull "${SRC_IMAGE}:${version}"; then
               pull_ok=true
               break
             fi
             echo "::warning::Pull attempt ${i} failed for ${SRC_IMAGE}:${version}, retrying in 5s"
-            sleep 5
+            sleep 3
           done
 
           if [ "$pull_ok" != "true" ]; then
@@ -209,7 +209,6 @@ jobs:
             done
           fi
 
-          docker rmi "${SRC_IMAGE}:${version}" 2>/dev/null || true
           echo "::notice::Successfully synced ${image_name}:${version}"
 
   sync_hassio_components:
@@ -264,13 +263,13 @@ jobs:
           echo "Processing ${component} version ${version} for ${ARCH}"
 
           pull_ok=false
-          for i in 1 2 3; do
+          for i in 1 2; do
             if docker pull "${SRC_IMAGE}:${version}"; then
               pull_ok=true
               break
             fi
             echo "::warning::Pull attempt ${i} failed for ${SRC_IMAGE}:${version}, retrying in 5s"
-            sleep 5
+            sleep 3
           done
 
           if [ "$pull_ok" != "true" ]; then
@@ -288,7 +287,6 @@ jobs:
             fi
           done
 
-          docker rmi "${SRC_IMAGE}:${version}" 2>/dev/null || true
           echo "::notice::Successfully synced ${component}:${version} for ${ARCH}"
 
   sync_supervisor:
@@ -326,13 +324,13 @@ jobs:
           echo "Processing supervisor ${ARCH} version ${version}"
 
           pull_ok=false
-          for i in 1 2 3; do
+          for i in 1 2; do
             if docker pull "${SRC_IMAGE}:${version}"; then
               pull_ok=true
               break
             fi
             echo "::warning::Pull attempt ${i} failed for ${SRC_IMAGE}:${version}, retrying in 5s"
-            sleep 5
+            sleep 3
           done
 
           if [ "$pull_ok" != "true" ]; then
@@ -350,17 +348,60 @@ jobs:
             fi
           done
 
-          docker rmi "${SRC_IMAGE}:${version}" 2>/dev/null || true
           echo "::notice::Successfully synced supervisor:${version} for ${ARCH}"
 
-  sync_custom:
+  prepare_custom:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    outputs:
+      custom_matrix: ${{ steps.set_matrix.outputs.custom_matrix }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Build matrix
+        id: set_matrix
+        env:
+          TARGET: ${{ inputs.custom_target }}
+          VERSION: ${{ inputs.custom_version }}
+        run: |
+          set -euo pipefail
+          target="$TARGET"
+          version="$VERSION"
+          if [ -z "$version" ]; then
+            echo "::error::custom_version is required (version number cannot be empty)"
+            exit 1
+          fi
+          case "$target" in
+            homeassistant)
+              # One matrix entry per machine in stable.json.
+              custom_matrix=$(jq -c --arg v "$version" \
+                '[.homeassistant | keys[] | {machine: ., version: $v}]' stable.json)
+              ;;
+            cli|dns|audio|multicast|observer|supervisor)
+              # One matrix entry per arch.
+              custom_matrix=$(jq -nc --arg v "$version" \
+                '["amd64","aarch64"] | map({arch: ., version: $v})')
+              ;;
+            *)
+              echo "::error::Unknown custom_target: ${target}"
+              exit 1
+              ;;
+          esac
+          echo "custom_matrix=${custom_matrix}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Matrix: ${custom_matrix}"
+
+  sync_custom:
+    needs: prepare_custom
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        include: ${{ fromJSON(needs.prepare_custom.outputs.custom_matrix) }}
+    steps:
       - name: Login to Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -368,26 +409,21 @@ jobs:
           username: ${{ secrets.CN_REGISTRY_USERNAME }}
           password: ${{ secrets.CN_REGISTRY_PASSWORD }}
 
-      - name: Sync custom image
+      - name: Sync image
         env:
           TARGET: ${{ inputs.custom_target }}
-          VERSION: ${{ inputs.custom_version }}
+          VERSION: ${{ matrix.version }}
+          MACHINE: ${{ matrix.machine }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
 
           target="$TARGET"
           version="$VERSION"
+          machine="$MACHINE"
+          arch="$ARCH"
 
-          if [ -z "$version" ]; then
-            echo "::error::custom_version is required (version number cannot be empty)"
-            exit 1
-          fi
-
-          # Sync a single image: pull with retry, tag all labels, push all.
-          # Tag strategy mirrors the automatic sync jobs:
-          #   homeassistant default  -> version + stable + latest + beta + rc + YYYY.M
-          #   homeassistant <other>  -> version + stable
-          #   component / supervisor -> version + latest
+          # Pull with retry, tag all labels, push all.
           sync_one() {
             local src="$1" dest="$2" ver="$3"
             shift 3
@@ -396,13 +432,13 @@ jobs:
             echo "::notice::Syncing ${src}:${ver} -> ${dest}"
 
             pull_ok=false
-            for i in 1 2 3; do
+            for i in 1 2; do
               if docker pull "${src}:${ver}"; then
                 pull_ok=true
                 break
               fi
-              echo "::warning::Pull attempt ${i} failed for ${src}:${ver}, retrying in 5s"
-              sleep 5
+              echo "::warning::Pull attempt ${i} failed for ${src}:${ver}, retrying in 3s"
+              sleep 3
             done
 
             if [ "$pull_ok" != "true" ]; then
@@ -418,50 +454,35 @@ jobs:
               fi
             done
 
-            docker rmi "${src}:${ver}" 2>/dev/null || true
             echo "::notice::Successfully synced ${dest}:${ver}"
           }
 
           case "$target" in
             homeassistant)
-              # Sync all machines listed in stable.json with the user-specified
-              # version. Machines whose upstream image doesn't have this version
-              # (e.g. pinned to an older release) are skipped with a warning.
-              mapfile -t machines < <(jq -r '.homeassistant | keys[]' stable.json)
-              for machine in "${machines[@]}"; do
-                if [ "$machine" = "default" ]; then
-                  image_name="home-assistant"
-                else
-                  image_name="${machine}-homeassistant"
-                fi
-                src="ghcr.io/home-assistant/${image_name}"
-                dest="${CN_REGISTRY}/${CN_NAMESPACE}/${image_name}"
-                if [ "$machine" = "default" ]; then
-                  ym_tag=$(echo "${version}" | awk -F. '{print $1"."$2}')
-                  sync_one "$src" "$dest" "$version" "${version}" "stable" "latest" "beta" "rc" "${ym_tag}" \
-                    || echo "::warning::Skipped ${image_name}:${version} (image not available)"
-                else
-                  sync_one "$src" "$dest" "$version" "${version}" "stable" \
-                    || echo "::warning::Skipped ${image_name}:${version} (image not available)"
-                fi
-              done
+              if [ "$machine" = "default" ]; then
+                image_name="home-assistant"
+              else
+                image_name="${machine}-homeassistant"
+              fi
+              src="ghcr.io/home-assistant/${image_name}"
+              dest="${CN_REGISTRY}/${CN_NAMESPACE}/${image_name}"
+              if [ "$machine" = "default" ]; then
+                ym_tag=$(echo "${version}" | awk -F. '{print $1"."$2}')
+                sync_one "$src" "$dest" "$version" "${version}" "stable" "latest" "beta" "rc" "${ym_tag}" \
+                  || echo "::warning::Skipped ${image_name}:${version} (image not available)"
+              else
+                sync_one "$src" "$dest" "$version" "${version}" "stable" \
+                  || echo "::warning::Skipped ${image_name}:${version} (image not available)"
+              fi
               ;;
             cli|dns|audio|multicast|observer)
-              for arch in amd64 aarch64; do
-                src="ghcr.io/home-assistant/${arch}-hassio-${target}"
-                dest="${CN_REGISTRY}/${CN_NAMESPACE}/${arch}-hassio-${target}"
-                sync_one "$src" "$dest" "$version" "${version}" "latest"
-              done
+              src="ghcr.io/home-assistant/${arch}-hassio-${target}"
+              dest="${CN_REGISTRY}/${CN_NAMESPACE}/${arch}-hassio-${target}"
+              sync_one "$src" "$dest" "$version" "${version}" "latest"
               ;;
             supervisor)
-              for arch in amd64 aarch64; do
-                src="ghcr.io/home-assistant-cn/${arch}-hassio-supervisor"
-                dest="${CN_REGISTRY}/${CN_NAMESPACE}/${arch}-hassio-supervisor"
-                sync_one "$src" "$dest" "$version" "${version}" "latest"
-              done
-              ;;
-            *)
-              echo "::error::Unknown custom_target: ${target}"
-              exit 1
+              src="ghcr.io/home-assistant-cn/${arch}-hassio-supervisor"
+              dest="${CN_REGISTRY}/${CN_NAMESPACE}/${arch}-hassio-supervisor"
+              sync_one "$src" "$dest" "$version" "${version}" "latest"
               ;;
           esac
