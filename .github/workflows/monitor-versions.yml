@@ -164,9 +164,17 @@ jobs:
 
           echo "Processing ${image_name} version ${version}"
 
+          # Determine platform: x86 machines → amd64, ARM machines → arm64
+          case "$machine" in
+            default|generic-x86-64|intel-nuc|qemux86-64)
+              platform="linux/amd64" ;;
+            *)
+              platform="linux/arm64" ;;
+          esac
+
           pull_ok=false
           for i in 1 2; do
-            if docker pull "${SRC_IMAGE}:${version}"; then
+            if docker pull --platform "$platform" "${SRC_IMAGE}:${version}"; then
               pull_ok=true
               break
             fi
@@ -248,9 +256,14 @@ jobs:
 
           echo "Processing ${component} version ${version} for ${ARCH}"
 
+          case "$ARCH" in
+            amd64) platform="linux/amd64" ;;
+            aarch64) platform="linux/arm64" ;;
+          esac
+
           pull_ok=false
           for i in 1 2; do
-            if docker pull "${SRC_IMAGE}:${version}"; then
+            if docker pull --platform "$platform" "${SRC_IMAGE}:${version}"; then
               pull_ok=true
               break
             fi
@@ -309,9 +322,14 @@ jobs:
 
           echo "Processing supervisor ${ARCH} version ${version}"
 
+          case "$ARCH" in
+            amd64) platform="linux/amd64" ;;
+            aarch64) platform="linux/arm64" ;;
+          esac
+
           pull_ok=false
           for i in 1 2; do
-            if docker pull "${SRC_IMAGE}:${version}"; then
+            if docker pull --platform "$platform" "${SRC_IMAGE}:${version}"; then
               pull_ok=true
               break
             fi
@@ -411,15 +429,15 @@ jobs:
 
           # Pull with retry, tag all labels, push all.
           sync_one() {
-            local src="$1" dest="$2" ver="$3"
-            shift 3
+            local src="$1" dest="$2" ver="$3" platform="$4"
+            shift 4
             local tags=("$@")
 
             echo "::notice::Syncing ${src}:${ver} -> ${dest}"
 
             pull_ok=false
             for i in 1 2; do
-              if docker pull "${src}:${ver}"; then
+              if docker pull --platform "$platform" "${src}:${ver}"; then
                 pull_ok=true
                 break
               fi
@@ -443,8 +461,13 @@ jobs:
             echo "::notice::Successfully synced ${dest}:${ver}"
           }
 
+          # Determine platform for docker pull
           case "$target" in
             homeassistant)
+              case "$machine" in
+                default|generic-x86-64|intel-nuc|qemux86-64) platform="linux/amd64" ;;
+                *) platform="linux/arm64" ;;
+              esac
               if [ "$machine" = "default" ]; then
                 image_name="home-assistant"
               else
@@ -454,21 +477,29 @@ jobs:
               dest="${CN_REGISTRY}/${CN_NAMESPACE}/${image_name}"
               if [ "$machine" = "default" ]; then
                 ym_tag=$(echo "${version}" | awk -F. '{print $1"."$2}')
-                sync_one "$src" "$dest" "$version" "${version}" "stable" "latest" "${ym_tag}" \
+                sync_one "$src" "$dest" "$version" "$platform" "${version}" "stable" "latest" "${ym_tag}" \
                   || echo "::warning::Skipped ${image_name}:${version} (image not available)"
               else
-                sync_one "$src" "$dest" "$version" "${version}" "stable" \
+                sync_one "$src" "$dest" "$version" "$platform" "${version}" "stable" \
                   || echo "::warning::Skipped ${image_name}:${version} (image not available)"
               fi
               ;;
             cli|dns|audio|multicast|observer)
+              case "$arch" in
+                amd64) platform="linux/amd64" ;;
+                aarch64) platform="linux/arm64" ;;
+              esac
               src="ghcr.io/home-assistant/${arch}-hassio-${target}"
               dest="${CN_REGISTRY}/${CN_NAMESPACE}/${arch}-hassio-${target}"
-              sync_one "$src" "$dest" "$version" "${version}" "latest"
+              sync_one "$src" "$dest" "$version" "$platform" "${version}" "latest"
               ;;
             supervisor)
+              case "$arch" in
+                amd64) platform="linux/amd64" ;;
+                aarch64) platform="linux/arm64" ;;
+              esac
               src="ghcr.io/home-assistant-cn/${arch}-hassio-supervisor"
               dest="${CN_REGISTRY}/${CN_NAMESPACE}/${arch}-hassio-supervisor"
-              sync_one "$src" "$dest" "$version" "${version}" "latest"
+              sync_one "$src" "$dest" "$version" "$platform" "${version}" "latest"
               ;;
           esac
