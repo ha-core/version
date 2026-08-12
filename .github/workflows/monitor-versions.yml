@@ -198,8 +198,11 @@ jobs:
           for tag in "${tags[@]}"; do
             docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:${tag}"
             if ! docker push "${DEST_IMAGE}:${tag}"; then
-              echo "::error::Failed to push ${DEST_IMAGE}:${tag}"
-              exit 1
+              sleep 3
+              if ! docker push "${DEST_IMAGE}:${tag}"; then
+                echo "::error::Failed to push ${DEST_IMAGE}:${tag}"
+                exit 1
+              fi
             fi
           done
 
@@ -276,13 +279,15 @@ jobs:
             exit 1
           fi
 
-          docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:${version}"
-          docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:latest"
-
-          for tag in "${version}" latest; do
+          tags=("${version}" "latest")
+          for tag in "${tags[@]}"; do
+            docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:${tag}"
             if ! docker push "${DEST_IMAGE}:${tag}"; then
-              echo "::error::Failed to push ${DEST_IMAGE}:${tag}"
-              exit 1
+              sleep 3
+              if ! docker push "${DEST_IMAGE}:${tag}"; then
+                echo "::error::Failed to push ${DEST_IMAGE}:${tag}"
+                exit 1
+              fi
             fi
           done
 
@@ -342,13 +347,15 @@ jobs:
             exit 1
           fi
 
-          docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:${version}"
-          docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:latest"
-
-          for tag in "${version}" latest; do
+          tags=("${version}" "latest")
+          for tag in "${tags[@]}"; do
+            docker tag "${SRC_IMAGE}:${version}" "${DEST_IMAGE}:${tag}"
             if ! docker push "${DEST_IMAGE}:${tag}"; then
-              echo "::error::Failed to push ${DEST_IMAGE}:${tag}"
-              exit 1
+              sleep 3
+              if ! docker push "${DEST_IMAGE}:${tag}"; then
+                echo "::error::Failed to push ${DEST_IMAGE}:${tag}"
+                exit 1
+              fi
             fi
           done
 
@@ -453,8 +460,11 @@ jobs:
             for tag in "${tags[@]}"; do
               docker tag "${src}:${ver}" "${dest}:${tag}"
               if ! docker push "${dest}:${tag}"; then
-                echo "::error::Failed to push ${dest}:${tag}"
-                return 1
+                sleep 3
+                if ! docker push "${dest}:${tag}"; then
+                  echo "::error::Failed to push ${dest}:${tag}"
+                  return 1
+                fi
               fi
             done
 
